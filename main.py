@@ -7,7 +7,7 @@ import streamlit as st
 from requests.auth import HTTPBasicAuth
 
 # --- CONFIGURATION ---
-BASE_URL = "https://tk1.wms.ocs.oraclecloud.com:443/arcoed_test/wms/lgfapi/v10/entity"
+BASE_URL = "https://k1.wms.ocs.oraclecloud.com:443/arcoed/wms/lgfapi/v10/entity"
 
 st.set_page_config(
     page_title="WMS Cycle Count Automation",
@@ -270,6 +270,7 @@ def fetch_ready_tasks(create_ts_gte, facility_id=4, create_ts_lte=None):
         f"facility_id={facility_id}",
         "task_type_id=19",
         "status_id=10",
+        "assigned_user__isnull=true"
         f"create_ts__gte={create_ts_gte}",
         "page_size=100"
     ]
