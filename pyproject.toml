@@ -13,6 +13,7 @@ dependencies = [
     "plotly>=7.1.0",
     "requests>=2.34.2",
     "streamlit>=1.64.0",
+    "streamlit-autorefresh>=1.0.1",
 ]
 
 [project.scripts]

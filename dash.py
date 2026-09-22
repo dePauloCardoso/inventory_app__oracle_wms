@@ -1,21 +1,32 @@
-import json
+import time
 import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 from requests.auth import HTTPBasicAuth
-from datetime import datetime, date, time
+from datetime import datetime
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
 BASE_URL = "https://k1.wms.ocs.oraclecloud.com:443/arcoed/wms/lgfapi/v10/entity"
 EXCEL_FILE = "location.xlsx"
+
+# Datas fixas do inventário (22/09/2026 a 27/09/2026)
+START_TS = "2026-09-22T00:00:51-03:00"
+END_TS   = "2026-09-27T23:59:59-03:00"
+
+REFRESH_INTERVAL_MINUTES = 15
+REFRESH_INTERVAL_MS = REFRESH_INTERVAL_MINUTES * 60 * 1000  # para st_autorefresh
 
 st.set_page_config(
     page_title="Progresso do Inventário & Bateria de Corredores",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# --- AUTO-REFRESH A CADA 15 MINUTOS ---
+_refresh_count = st_autorefresh(interval=REFRESH_INTERVAL_MS, key="auto_refresh")
 
 # --- AUTENTICAÇÃO ---
 def login_screen():
@@ -45,7 +56,7 @@ def get_session():
     session.headers.update({"Content-Type": "application/json"})
     return session
 
-# --- CARREGAMENTO DE DADOS COM FILTRO DINÂMICO DE PERÍODO ---
+# --- CARREGAMENTO DE DADOS ---
 @st.cache_data
 def load_master_locations(filepath=EXCEL_FILE):
     """Carrega o arquivo location.xlsx e extrai área, corredor, módulo e nível."""
@@ -53,68 +64,71 @@ def load_master_locations(filepath=EXCEL_FILE):
         df = pd.read_excel(filepath)
         parts = df['texto_exibicao'].str.split('-', expand=True)
         if parts.shape[1] >= 4:
-            df['area'] = parts[0]
+            df['area']  = parts[0]
             df['aisle'] = parts[1]
-            df['bay'] = parts[2]
+            df['bay']   = parts[2]
             df['level'] = parts[3]
         else:
-            df['area'] = 'DESCONHECIDO'
+            df['area']  = 'DESCONHECIDO'
             df['aisle'] = 'DESCONHECIDO'
-            df['bay'] = '0'
+            df['bay']   = '0'
             df['level'] = '0'
         return df
     except Exception as e:
         st.error(f"Erro ao carregar o arquivo {filepath}: {e}")
         return pd.DataFrame()
 
-def fetch_cc_adjustment_headers(start_ts, end_ts=None):
-    """Busca os registros de cc_adjustment_hdr na instalação 4 filtrados pelo período."""
+def fetch_cc_adjustment_headers():
+    """Busca cc_adjustment_hdr no período fixo de 22/09 a 27/09/2026."""
     session = get_session()
     all_results = []
-    
-    url = f"{BASE_URL}/cc_adjustment_hdr?facility_id=4&page_mode=paged&create_ts__gte={start_ts}"
-    if end_ts:
-        url += f"&create_ts__lte={end_ts}"
-    
+
+    url = (
+        f"{BASE_URL}/cc_adjustment_hdr"
+        f"?facility_id=4&page_mode=paged"
+        f"&create_ts__gte={START_TS}"
+        f"&create_ts__lte={END_TS}"
+    )
+
     with st.spinner("Buscando ajustes de contagem do WMS..."):
         response = session.get(url)
         if response.status_code != 200:
             st.error(f"Falha ao buscar cc_adjustment_hdr. Código de Status: {response.status_code}")
             return pd.DataFrame()
-            
+
         data = response.json()
         all_results.extend(data.get("results", []))
-        
+
         page_count = data.get("page_count", 1)
         for page in range(2, min(page_count + 1, 15)):
             p_url = f"{url}&page={page}"
             res = session.get(p_url)
             if res.status_code == 200:
                 all_results.extend(res.json().get("results", []))
-                
+
     if not all_results:
         return pd.DataFrame()
 
-    df_hdr = pd.json_normalize(all_results)
-    return df_hdr
+    return pd.json_normalize(all_results)
 
 # --- MOTOR DE VALIDAÇÃO ---
 def evaluate_locations(df_master, df_hdr):
     if df_hdr.empty:
-        df_master['count_num'] = 0
-        df_master['status_list'] = "[]"
+        df_master = df_master.copy()
+        df_master['count_num']         = 0
+        df_master['status_list']       = "[]"
         df_master['validation_status'] = 'Não Contado'
         return df_master
 
-    loc_col = "location_id.key" if "location_id.key" in df_hdr.columns else "location_id"
+    loc_col    = "location_id.key" if "location_id.key" in df_hdr.columns else "location_id"
     status_col = "status_id"
-    
+
     df_hdr['loc_key'] = df_hdr[loc_col].astype(str)
 
     def check_location(group):
-        statuses = group[status_col].tolist()
+        statuses  = group[status_col].tolist()
         count_num = len(statuses)
-        
+
         if count_num == 1:
             is_valid = 70 in statuses
         elif count_num in [2, 3]:
@@ -125,34 +139,33 @@ def evaluate_locations(df_master, df_hdr):
         status_label = "Validado (OK)" if is_valid else "Pendente / Rejeitado"
 
         return pd.Series({
-            "count_num": count_num,
-            "status_list": str(statuses),
+            "count_num":         count_num,
+            "status_list":       str(statuses),
             "validation_status": status_label
         })
 
     loc_summary = df_hdr.groupby('loc_key').apply(check_location).reset_index()
 
     merged = pd.merge(
-        df_master, 
-        loc_summary, 
-        left_on='texto_exibicao', 
-        right_on='loc_key', 
+        df_master,
+        loc_summary,
+        left_on='texto_exibicao',
+        right_on='loc_key',
         how='left'
     )
 
     merged['validation_status'] = merged['validation_status'].fillna('Não Contado')
-    merged['count_num'] = merged['count_num'].fillna(0).astype(int)
+    merged['count_num']         = merged['count_num'].fillna(0).astype(int)
 
     return merged
 
-# --- GRÁFICOS EMPILHADOS 100% (COM BASE INICIANDO EM FINALIZADAS) ---
+# --- GRÁFICOS EMPILHADOS 100% ---
 def render_split_100pct_stacked_bars(df_eval, selected_level="Todos"):
     df_chart = df_eval.copy()
-    
+
     if selected_level != "Todos":
         df_chart = df_chart[df_chart['level'].astype(str) == str(selected_level)]
 
-    # Agrupa por corredor
     aisle_df = df_chart.groupby('aisle').agg(
         total=('texto_exibicao', 'count'),
         validated=('validation_status', lambda x: (x == "Validado (OK)").sum())
@@ -162,23 +175,19 @@ def render_split_100pct_stacked_bars(df_eval, selected_level="Todos"):
         st.warning("Nenhum dado encontrado para o nível selecionado.")
         return
 
-    # Ordena os corredores em ordem CRESCENTE (ASC)
-    aisle_df['aisle_str'] = aisle_df['aisle'].astype(str)
-    aisle_df = aisle_df.sort_values(by='aisle_str', ascending=True)
-
-    aisle_df['pending'] = aisle_df['total'] - aisle_df['validated']
+    aisle_df['aisle_str']     = aisle_df['aisle'].astype(str)
+    aisle_df                  = aisle_df.sort_values(by='aisle_str', ascending=True)
+    aisle_df['pending']       = aisle_df['total'] - aisle_df['validated']
     aisle_df['pct_validated'] = (aisle_df['validated'] / aisle_df['total'] * 100).fillna(0)
-    aisle_df['pct_pending'] = (aisle_df['pending'] / aisle_df['total'] * 100).fillna(0)
+    aisle_df['pct_pending']   = (aisle_df['pending']   / aisle_df['total'] * 100).fillna(0)
 
-    # Divide os corredores na metade (Parte 1 e Parte 2)
-    half_idx = (len(aisle_df) + 1) // 2
-    top_half = aisle_df.iloc[:half_idx]
+    half_idx    = (len(aisle_df) + 1) // 2
+    top_half    = aisle_df.iloc[:half_idx]
     bottom_half = aisle_df.iloc[half_idx:]
 
     def build_chart_figure(df_sub):
         fig = go.Figure()
 
-        # 1. Barra de FINALIZADAS / VALIDADAS (Azul Escuro) - COMEÇA DA BASE (0%)
         fig.add_trace(go.Bar(
             x=df_sub['aisle_str'],
             y=df_sub['pct_validated'],
@@ -190,7 +199,6 @@ def render_split_100pct_stacked_bars(df_eval, selected_level="Todos"):
             insidetextanchor="middle"
         ))
 
-        # 2. Barra de PENDENTES (Laranja) - FICA EMPILHADA NO TOPO
         fig.add_trace(go.Bar(
             x=df_sub['aisle_str'],
             y=df_sub['pct_pending'],
@@ -230,45 +238,68 @@ def render_split_100pct_stacked_bars(df_eval, selected_level="Todos"):
         )
         return fig
 
-    # Gráfico Parte 1
     title_top = f"Parte 1: Corredores ({top_half['aisle_str'].iloc[0]} - {top_half['aisle_str'].iloc[-1]})"
     st.markdown(f"##### **{title_top}**")
-    fig_top = build_chart_figure(top_half)
-    st.plotly_chart(fig_top, use_container_width=True)
+    st.plotly_chart(build_chart_figure(top_half), use_container_width=True)
 
-    # Gráfico Parte 2
     if not bottom_half.empty:
         title_bottom = f"Parte 2: Corredores ({bottom_half['aisle_str'].iloc[0]} - {bottom_half['aisle_str'].iloc[-1]})"
         st.markdown(f"##### **{title_bottom}**")
-        fig_bottom = build_chart_figure(bottom_half)
-        st.plotly_chart(fig_bottom, use_container_width=True)
+        st.plotly_chart(build_chart_figure(bottom_half), use_container_width=True)
+
+# --- FUNÇÃO DE BUSCA COM TTL ---
+def load_data(df_master, force=False):
+    """Busca dados do WMS e armazena no session_state. Respeita TTL de 15 min."""
+    now = time.time()
+    ttl = REFRESH_INTERVAL_MINUTES * 60
+
+    needs_refresh = (
+        force
+        or "df_evaluated" not in st.session_state
+        or (now - st.session_state.get("last_fetch_time", 0)) >= ttl
+    )
+
+    if needs_refresh:
+        df_hdr  = fetch_cc_adjustment_headers()
+        df_eval = evaluate_locations(df_master, df_hdr)
+        st.session_state.df_evaluated   = df_eval
+        st.session_state.last_fetch_time = now
+
+    return st.session_state.df_evaluated
 
 # --- APLICAÇÃO PRINCIPAL ---
 def main():
     login_screen()
 
     st.sidebar.title("Monitor de Locais WMS")
+
     if st.sidebar.button("Sair (Logout)"):
         st.session_state.clear()
         st.rerun()
 
-    # --- FILTRO DE PERÍODO NA BARRA LATERAL ---
     st.sidebar.write("---")
-    st.sidebar.subheader("Filtro de Período da API (`create_ts`)")
-    
-    start_d = st.sidebar.date_input("Data Inicial (`create_ts__gte`)", value=date(2026, 9, 15))
-    start_t = st.sidebar.time_input("Hora Inicial", value=time(0, 0, 51))
-    
-    use_end_date = st.sidebar.checkbox("Aplicar Filtro de Data Final (`create_ts__lte`)")
-    end_d = None
-    if use_end_date:
-        end_d = st.sidebar.date_input("Data Final", value=date(2026, 9, 21))
-        end_t = st.sidebar.time_input("Hora Final", value=time(23, 59, 59))
-        end_ts = f"{end_d.isoformat()}T{end_t.strftime('%H:%M:%S')}-03:00"
-    else:
-        end_ts = None
+    st.sidebar.markdown("**Período do Inventário (fixo)**")
+    st.sidebar.markdown("📅 `22/09/2026` → `27/09/2026`")
 
-    start_ts = f"{start_d.isoformat()}T{start_t.strftime('%H:%M:%S')}-03:00"
+    # --- INFO DE AUTO-REFRESH NO SIDEBAR ---
+    st.sidebar.write("---")
+    last_fetch = st.session_state.get("last_fetch_time")
+    if last_fetch:
+        elapsed_s    = int(time.time() - last_fetch)
+        remaining_s  = max(0, REFRESH_INTERVAL_MINUTES * 60 - elapsed_s)
+        remaining_min = remaining_s // 60
+        remaining_sec = remaining_s % 60
+        last_str     = datetime.fromtimestamp(last_fetch).strftime("%H:%M:%S")
+        st.sidebar.success(
+            f"🕐 Última atualização: **{last_str}**\n\n"
+            f"⏱️ Próxima em: **{remaining_min:02d}:{remaining_sec:02d}**"
+        )
+    else:
+        st.sidebar.info("Aguardando primeira carga...")
+
+    if st.sidebar.button("🔄 Atualizar Agora"):
+        load_data(load_master_locations(), force=True)
+        st.rerun()
 
     # 1. Carrega o cadastro mestre de locais
     df_master = load_master_locations()
@@ -277,37 +308,22 @@ def main():
 
     st.title("Painel de Validação de Inventário")
 
-    # 2. Busca Dados do WMS
-    if "df_evaluated" not in st.session_state:
-        if st.button("Buscar e Calcular Progresso", type="primary"):
-            df_hdr = fetch_cc_adjustment_headers(start_ts, end_ts)
-            df_eval = evaluate_locations(df_master, df_hdr)
-            st.session_state.df_evaluated = df_eval
-            st.session_state.df_hdr = df_hdr
-            st.rerun()
-        else:
-            st.info(f"Clique em 'Buscar e Calcular Progresso' para consultar o Oracle WMS a partir de `{start_ts}`.")
-            st.stop()
-    else:
-        if st.sidebar.button("Atualizar Dados"):
-            del st.session_state["df_evaluated"]
-            st.rerun()
-
-    df_eval = st.session_state.df_evaluated
+    # 2. Busca / usa dados cacheados (respeita TTL de 15 min)
+    df_eval = load_data(df_master)
 
     # 3. Métricas Principais
-    total_locs = len(df_eval)
-    validated_locs = len(df_eval[df_eval['validation_status'] == "Validado (OK)"])
-    pending_locs = len(df_eval[df_eval['validation_status'] == "Pendente / Rejeitado"])
-    not_counted = len(df_eval[df_eval['validation_status'] == "Não Contado"])
+    total_locs       = len(df_eval)
+    validated_locs   = len(df_eval[df_eval['validation_status'] == "Validado (OK)"])
+    pending_locs     = len(df_eval[df_eval['validation_status'] == "Pendente / Rejeitado"])
+    not_counted      = len(df_eval[df_eval['validation_status'] == "Não Contado"])
     overall_progress = (validated_locs / total_locs * 100) if total_locs > 0 else 0
 
     col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Total de Locais", f"{total_locs:,}")
-    col2.metric("Validados (Aprovados)", f"{validated_locs:,}")
+    col1.metric("Total de Locais",        f"{total_locs:,}")
+    col2.metric("Validados (Aprovados)",  f"{validated_locs:,}")
     col3.metric("Pendentes / Rejeitados", f"{pending_locs:,}")
-    col4.metric("Não Contados", f"{not_counted:,}")
-    col5.metric("Taxa de Conclusão", f"{overall_progress:.1f}%")
+    col4.metric("Não Contados",           f"{not_counted:,}")
+    col5.metric("Taxa de Conclusão",      f"{overall_progress:.1f}%")
 
     st.progress(overall_progress / 100.0)
 
@@ -316,8 +332,8 @@ def main():
     st.subheader("Detalhamento de Progresso por Corredor (Gráfico 100% Empilhado)")
 
     available_levels = sorted([str(l) for l in df_eval['level'].dropna().unique()])
-    level_options = ["Todos"] + available_levels
-    
+    level_options    = ["Todos"] + available_levels
+
     selected_level = st.radio(
         "Filtrar por Nível:",
         options=level_options,
@@ -325,30 +341,29 @@ def main():
         index=0
     )
 
-    # Renderiza os dois gráficos (Parte 1 e Parte 2)
     render_split_100pct_stacked_bars(df_eval, selected_level=selected_level)
 
     # 5. Visão de Grid Interativa do Corredor
     st.write("---")
     st.subheader("Grid Interativo do Corredor (Módulos vs Níveis)")
 
-    sorted_aisles = sorted(df_eval['aisle'].dropna().unique())
+    sorted_aisles  = sorted(df_eval['aisle'].dropna().unique())
     selected_aisle = st.selectbox("Selecione o Corredor para Inspecionar:", sorted_aisles)
 
     if selected_aisle:
         df_aisle = df_eval[df_eval['aisle'] == selected_aisle].copy()
 
         status_map = {
-            "Validado (OK)": 2,
+            "Validado (OK)":        2,
             "Pendente / Rejeitado": 1,
-            "Não Contado": 0
+            "Não Contado":          0
         }
         df_aisle['status_code'] = df_aisle['validation_status'].map(status_map)
 
         grid = df_aisle.pivot_table(
-            index='level', 
-            columns='bay', 
-            values='status_code', 
+            index='level',
+            columns='bay',
+            values='status_code',
             aggfunc='first'
         ).fillna(-1)
 
@@ -358,9 +373,9 @@ def main():
             x=grid.columns,
             y=grid.index,
             color_continuous_scale=[
-                [0.0, "#E0E0E0"],   # Não Contado (Cinza)
-                [0.5, "#FF9800"],   # Pendente / Rejeitado (Laranja)
-                [1.0, "#4CAF50"]    # Validado (Verde)
+                [0.0, "#E0E0E0"],
+                [0.5, "#FF9800"],
+                [1.0, "#4CAF50"]
             ],
             title=f"Corredor {selected_aisle} — Leiaute da Estrutura"
         )
@@ -370,7 +385,7 @@ def main():
         with st.expander(f"Ver Detalhes dos Locais do Corredor {selected_aisle}"):
             st.dataframe(
                 df_aisle[[
-                    'texto_exibicao', 'bay', 'level', 'count_num', 
+                    'texto_exibicao', 'bay', 'level', 'count_num',
                     'validation_status', 'status_list'
                 ]],
                 use_container_width=True
