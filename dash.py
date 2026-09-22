@@ -8,7 +8,7 @@ from requests.auth import HTTPBasicAuth
 from datetime import datetime, date, time
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-BASE_URL = "https://tk1.wms.ocs.oraclecloud.com:443/arcoed_test/wms/lgfapi/v10/entity"
+BASE_URL = "https://k1.wms.ocs.oraclecloud.com:443/arcoed/wms/lgfapi/v10/entity"
 EXCEL_FILE = "location.xlsx"
 
 st.set_page_config(
