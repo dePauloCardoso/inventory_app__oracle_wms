@@ -1,21 +1,22 @@
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, date, time as dt_time, timedelta
 import pandas as pd
 import requests
 import streamlit as st
 from requests.auth import HTTPBasicAuth
 
-# --- CONFIGURATION ---
+# --- CONFIGURAÇÃO ---
 BASE_URL = "https://k1.wms.ocs.oraclecloud.com:443/arcoed/wms/lgfapi/v10/entity"
+BATCH_SIZE = 100  # Tamanho do lote máximo para chamadas em Bulk na API WMS
 
 st.set_page_config(
-    page_title="WMS Cycle Count Automation",
+    page_title="WMS Cycle Count Automation & Approvals",
     page_icon="📦",
     layout="wide"
 )
 
-# Custom CSS for modern styling
+# Estilização CSS customizada
 st.markdown("""
 <style>
     .metric-card {
@@ -32,14 +33,23 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# --- AUTHENTICATION ---
+# --- AUXILIAR DE FATIAMENTO EM LOTES (BATCHES DE 100) ---
+def chunk_list(lst, chunk_size=BATCH_SIZE):
+    """
+    Divide qualquer lista em sublistas de tamanho até `chunk_size` (padrão 100).
+    """
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i:i + chunk_size]
+
+
+# --- TELA DE AUTENTICAÇÃO ---
 def login_screen():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
 
     if not st.session_state.authenticated:
-        st.title("📦 WMS Cycle Count - Automação Total")
-        st.info("Entre com suas credenciais do Oracle WMS e defina o período de tarefas a processar.")
+        st.title("📦 WMS Cycle Count - Automação Total & Aprovações")
+        st.info("Entre com suas credenciais do Oracle WMS para acessar o painel de aprovações e comparativos.")
         with st.form("login_form"):
             col_u, col_p = st.columns(2)
             with col_u:
@@ -50,11 +60,14 @@ def login_screen():
             st.write("---")
             st.markdown("##### 📅 Filtro Inicial de Período das Tarefas")
             col_d1, col_d2 = st.columns(2)
-            today = datetime.now().date()
+            
+            fixed_start = date(2026, 9, 22)
+            fixed_end = date(2026, 9, 27)
+
             with col_d1:
-                start_date_input = st.date_input("Data Inicial", value=today - timedelta(days=3))
+                start_date_input = st.date_input("Data Inicial", value=fixed_start)
             with col_d2:
-                end_date_input = st.date_input("Data Final", value=today)
+                end_date_input = st.date_input("Data Final", value=fixed_end)
 
             submit_button = st.form_submit_button("Entrar no Sistema")
 
@@ -71,7 +84,7 @@ def login_screen():
         st.stop()
 
 
-# --- API HELPER FUNCTIONS ---
+# --- FUNÇÕES AUXILIARES DA API REST ORACLE WMS ---
 def get_session():
     session = requests.Session()
     session.auth = HTTPBasicAuth(st.session_state.username, st.session_state.password)
@@ -116,10 +129,8 @@ def fetch_details(hdr_ids):
     """
     session = get_session()
     dtl_data = []
-    chunk_size = 50
 
-    for i in range(0, len(hdr_ids), chunk_size):
-        batch_ids = hdr_ids[i : i + chunk_size]
+    for batch_ids in chunk_list(hdr_ids, chunk_size=BATCH_SIZE):
         url = f"{BASE_URL}/cc_adjustment_dtl?cc_adjustment_hdr_id__in={','.join(batch_ids)}&page_size=100"
         while url:
             resp = session.get(url)
@@ -136,7 +147,8 @@ def fetch_details(hdr_ids):
 
 def bulk_approve_headers(df_approve, facility_id=4):
     """
-    Executa POST para /cc_adjustment_hdr/bulk_approve/ com fallback individual.
+    Executa POST para /cc_adjustment_hdr/bulk_approve/ fatiando em lotes de 100
+    com fallback individual apenas para itens do lote que falharem.
     """
     session = get_session()
     approve_url = f"{BASE_URL}/cc_adjustment_hdr/bulk_approve/"
@@ -145,61 +157,70 @@ def bulk_approve_headers(df_approve, facility_id=4):
     if not group_numbers:
         return None
 
-    payload = {
-        "parameters": {
-            "facility_id": facility_id,
-            "group_nbr__in": group_numbers
-        },
-        "options": {
-            "comment": "Aprovado automaticamente pelo sistema (Contagens coincidem)",
-            "commit_frequency": 1
-        }
-    }
+    total_success = 0
+    total_failures = 0
+    all_details = {}
 
-    response = session.post(approve_url, json=payload)
-
-    # Fallback individual caso o endpoint em lote retorne erro
-    if response.status_code != 200:
-        st.warning("Bulk approve falhou. Executando aprovação individual por group_nbr...")
-        success_count, failure_count, details = 0, 0, {}
-        unique_groups_df = df_approve.drop_duplicates(subset=["group_nbr"])
-
-        for _, row in unique_groups_df.iterrows():
-            single_url = f"{BASE_URL}/cc_adjustment_hdr/approve/"
-            single_payload = {
-                "parameters": {
-                    "facility_id": int(row.get("facility_id.id", facility_id)),
-                    "location_barcode": str(row.get("location_id.key", "")),
-                    "group_nbr": int(row["group_nbr"])
-                },
-                "options": {
-                    "comment": "Aprovado automaticamente pelo sistema"
-                }
+    # Processamento em lotes de 100 para evitar sobrecarregar a API
+    for batch_groups in chunk_list(group_numbers, chunk_size=BATCH_SIZE):
+        payload = {
+            "parameters": {
+                "facility_id": facility_id,
+                "group_nbr__in": batch_groups
+            },
+            "options": {
+                "comment": "Aprovado automaticamente pelo sistema (Contagens coincidem)",
+                "commit_frequency": 1
             }
-            single_res = session.post(single_url, json=single_payload)
-            if single_res.status_code in [200, 204]:
-                success_count += 1
-            else:
-                failure_count += 1
-                details[str(row["group_nbr"])] = f"Status {single_res.status_code}"
-
-        mock_response = requests.Response()
-        mock_response.status_code = 200
-        mock_payload = {
-            "record_count": len(unique_groups_df),
-            "success_count": success_count,
-            "failure_count": failure_count,
-            "details": details if details else None
         }
-        mock_response._content = json.dumps(mock_payload).encode('utf-8')
-        return mock_response
 
-    return response
+        response = session.post(approve_url, json=payload)
+
+        if response.status_code == 200:
+            res_data = response.json()
+            total_success += res_data.get("success_count", len(batch_groups))
+            total_failures += res_data.get("failure_count", 0)
+        else:
+            # Fallback individual apenas para os itens deste lote de 100
+            st.warning(f"Lote de aprovação (tamanho {len(batch_groups)}) falhou no bulk. Executando fallback individual...")
+            batch_df = df_approve[df_approve["group_nbr"].isin(batch_groups)].drop_duplicates(subset=["group_nbr"])
+
+            for _, row in batch_df.iterrows():
+                single_url = f"{BASE_URL}/cc_adjustment_hdr/approve/"
+                single_payload = {
+                    "parameters": {
+                        "facility_id": int(row.get("facility_id.id", facility_id)),
+                        "location_barcode": str(row.get("location_id.key", "")),
+                        "group_nbr": int(row["group_nbr"])
+                    },
+                    "options": {
+                        "comment": "Aprovado automaticamente pelo sistema"
+                    }
+                }
+                single_res = session.post(single_url, json=single_payload)
+                if single_res.status_code in [200, 204]:
+                    total_success += 1
+                else:
+                    total_failures += 1
+                    all_details[str(row["group_nbr"])] = f"Status {single_res.status_code}"
+
+    # Retorna objeto simulado unificado de resposta
+    mock_response = requests.Response()
+    mock_response.status_code = 200
+    mock_payload = {
+        "record_count": len(group_numbers),
+        "success_count": total_success,
+        "failure_count": total_failures,
+        "details": all_details if all_details else None
+    }
+    mock_response._content = json.dumps(mock_payload).encode('utf-8')
+    return mock_response
 
 
 def bulk_reject_headers(df_reject, facility_id=4):
     """
-    Executa POST para /cc_adjustment_hdr/bulk_reject/ com fallback individual.
+    Executa POST para /cc_adjustment_hdr/bulk_reject/ fatiando em lotes de 100
+    com fallback individual por lote se necessário.
     """
     session = get_session()
     reject_url = f"{BASE_URL}/cc_adjustment_hdr/bulk_reject/"
@@ -208,56 +229,61 @@ def bulk_reject_headers(df_reject, facility_id=4):
     if not group_numbers:
         return None
 
-    payload = {
-        "parameters": {
-            "facility_id": facility_id,
-            "group_nbr__in": group_numbers
-        },
-        "options": {
-            "comment": "Rejeitado automaticamente pelo sistema",
-            "commit_frequency": 1
-        }
-    }
+    total_success = 0
+    total_failures = 0
+    all_details = {}
 
-    response = session.post(reject_url, json=payload)
-
-    # Fallback individual caso o endpoint em lote retorne erro
-    if response.status_code != 200:
-        st.warning("Bulk reject falhou. Executando rejeição individual por group_nbr...")
-        success_count, failure_count, details = 0, 0, {}
-        unique_groups_df = df_reject.drop_duplicates(subset=["group_nbr"])
-
-        for _, row in unique_groups_df.iterrows():
-            single_url = f"{BASE_URL}/cc_adjustment_hdr/reject/"
-            single_payload = {
-                "parameters": {
-                    "facility_id": int(row.get("facility_id.id", facility_id)),
-                    "location_barcode": str(row.get("location_id.key", "")),
-                    "group_nbr": int(row["group_nbr"])
-                },
-                "options": {
-                    "comment": "Rejeitado automaticamente pelo sistema"
-                }
+    for batch_groups in chunk_list(group_numbers, chunk_size=BATCH_SIZE):
+        payload = {
+            "parameters": {
+                "facility_id": facility_id,
+                "group_nbr__in": batch_groups
+            },
+            "options": {
+                "comment": "Rejeitado automaticamente pelo sistema",
+                "commit_frequency": 1
             }
-            single_res = session.post(single_url, json=single_payload)
-            if single_res.status_code in [200, 204]:
-                success_count += 1
-            else:
-                failure_count += 1
-                details[str(row["group_nbr"])] = f"Status {single_res.status_code}"
-
-        mock_response = requests.Response()
-        mock_response.status_code = 200
-        mock_payload = {
-            "record_count": len(unique_groups_df),
-            "success_count": success_count,
-            "failure_count": failure_count,
-            "details": details if details else None
         }
-        mock_response._content = json.dumps(mock_payload).encode('utf-8')
-        return mock_response
 
-    return response
+        response = session.post(reject_url, json=payload)
+
+        if response.status_code == 200:
+            res_data = response.json()
+            total_success += res_data.get("success_count", len(batch_groups))
+            total_failures += res_data.get("failure_count", 0)
+        else:
+            st.warning(f"Lote de rejeição (tamanho {len(batch_groups)}) falhou no bulk. Executando fallback individual...")
+            batch_df = df_reject[df_reject["group_nbr"].isin(batch_groups)].drop_duplicates(subset=["group_nbr"])
+
+            for _, row in batch_df.iterrows():
+                single_url = f"{BASE_URL}/cc_adjustment_hdr/reject/"
+                single_payload = {
+                    "parameters": {
+                        "facility_id": int(row.get("facility_id.id", facility_id)),
+                        "location_barcode": str(row.get("location_id.key", "")),
+                        "group_nbr": int(row["group_nbr"])
+                    },
+                    "options": {
+                        "comment": "Rejeitado automaticamente pelo sistema"
+                    }
+                }
+                single_res = session.post(single_url, json=single_payload)
+                if single_res.status_code in [200, 204]:
+                    total_success += 1
+                else:
+                    total_failures += 1
+                    all_details[str(row["group_nbr"])] = f"Status {single_res.status_code}"
+
+    mock_response = requests.Response()
+    mock_response.status_code = 200
+    mock_payload = {
+        "record_count": len(group_numbers),
+        "success_count": total_success,
+        "failure_count": total_failures,
+        "details": all_details if all_details else None
+    }
+    mock_response._content = json.dumps(mock_payload).encode('utf-8')
+    return mock_response
 
 
 def fetch_ready_tasks(create_ts_gte, facility_id=4, create_ts_lte=None):
@@ -270,7 +296,6 @@ def fetch_ready_tasks(create_ts_gte, facility_id=4, create_ts_lte=None):
         f"facility_id={facility_id}",
         "task_type_id=19",
         "status_id=10",
-        "assigned_user__isnull=true"
         f"create_ts__gte={create_ts_gte}",
         "page_size=100"
     ]
@@ -293,9 +318,9 @@ def fetch_ready_tasks(create_ts_gte, facility_id=4, create_ts_lte=None):
     return pd.json_normalize(tasks_data)
 
 
-def bulk_hold_tasks(task_ids):
+def bulk_hold_tasks(task_ids, batch_size=BATCH_SIZE):
     """
-    Coloca tarefas em retenção usando POST /task/bulk_hold/ com fallback individual.
+    Coloca tarefas em retenção usando POST /task/bulk_hold/ em lotes de 100 com fallback.
     """
     session = get_session()
     hold_url = f"{BASE_URL}/task/bulk_hold/"
@@ -303,57 +328,60 @@ def bulk_hold_tasks(task_ids):
     if not task_ids:
         return None
 
-    payload = {
-        "parameters": {
-            "id__in": [int(tid) for tid in task_ids]
-        },
-        "options": {
-            "commit_frequency": 1
+    total_success = 0
+    total_failures = 0
+    all_details = {}
+
+    for batch_tasks in chunk_list(task_ids, chunk_size=batch_size):
+        payload = {
+            "parameters": {
+                "id__in": [int(tid) for tid in batch_tasks]
+            },
+            "options": {
+                "commit_frequency": 1
+            }
         }
+
+        response = session.post(hold_url, json=payload)
+
+        if response.status_code == 200:
+            res_data = response.json()
+            total_success += res_data.get("success_count", len(batch_tasks))
+            total_failures += res_data.get("failure_count", 0)
+        else:
+            st.warning(f"Lote de retenção/hold (tamanho {len(batch_tasks)}) falhou no bulk. Executando fallback individual...")
+            for tid in batch_tasks:
+                single_url = f"{BASE_URL}/task/{tid}/hold/"
+                single_res = session.post(single_url)
+                if single_res.status_code in [200, 204]:
+                    total_success += 1
+                else:
+                    total_failures += 1
+                    all_details[str(tid)] = f"Status {single_res.status_code}"
+
+    mock_response = requests.Response()
+    mock_response.status_code = 200
+    mock_payload = {
+        "record_count": len(task_ids),
+        "success_count": total_success,
+        "failure_count": total_failures,
+        "details": all_details if all_details else None
     }
-
-    response = session.post(hold_url, json=payload)
-
-    if response.status_code != 200:
-        st.warning("Bulk hold falhou. Executando retenção individual de tarefas...")
-        success_count, failure_count, details = 0, 0, {}
-        for tid in task_ids:
-            single_url = f"{BASE_URL}/task/{tid}/hold/"
-            single_res = session.post(single_url)
-            if single_res.status_code in [200, 204]:
-                success_count += 1
-            else:
-                failure_count += 1
-                details[str(tid)] = f"Status {single_res.status_code}"
-
-        mock_response = requests.Response()
-        mock_response.status_code = 200
-        mock_payload = {
-            "record_count": len(task_ids),
-            "success_count": success_count,
-            "failure_count": failure_count,
-            "details": details if details else None
-        }
-        mock_response._content = json.dumps(mock_payload).encode('utf-8')
-        return mock_response
-
-    return response
+    mock_response._content = json.dumps(mock_payload).encode('utf-8')
+    return mock_response
 
 
-# --- STATUS TRANSLATION CONSTANTS ---
+# --- TRADUÇÃO DE STATUS ---
 STATUS_MAP_PT = {
-    10: "Em Andamento",    # In Progress
-    20: "Pendente",        # Pending
-    30: "Aprovado",        # Approved
-    50: "Rejeitado",       # Rejected
-    70: "Sem Divergência", # No Variance
-    99: "Cancelado"        # Cancelled
+    10: "Em Andamento",
+    20: "Pendente",
+    30: "Aprovado",
+    50: "Rejeitado",
+    70: "Sem Divergência",
+    99: "Cancelado"
 }
 
 def translate_status_id(val):
-    """
-    Traduz o status numérico do Oracle WMS para a descrição oficial em português.
-    """
     try:
         if pd.isna(val) or val is None:
             return "Não Informado"
@@ -372,38 +400,17 @@ def translate_status_id(val):
         return mapping.get(str(val).strip().lower(), str(val))
 
 
-# --- DATA PREPARATION & MULTI-COUNT LOGIC ---
-def normalize_lpn(val):
-    if pd.isna(val) or val is None:
-        return "SEM LPN"
-    s = str(val).strip()
-    if s in ("", "None", "nan", "null", "0", "0.0"):
-        return "SEM LPN"
-    return s
-
-
-def evaluate_multi_count(df):
-    """
-    Executa a checagem no nível de detalhe (Item, Quantidade, LPN/Container)
-    e define as ações automáticas de 1ª, 2ª e 3ª contagens.
-    """
+# --- PREPARAÇÃO DE DADOS & REGRAS MULTI-CONTAGEM ---
+def evaluate_multi_count_dataset(df):
     if df.empty:
         return df, pd.DataFrame()
 
     df = df.copy()
-    if "expected_qty" not in df.columns:
-        df["expected_qty"] = 0
-    else:
-        df["expected_qty"] = pd.to_numeric(df["expected_qty"], errors="coerce").fillna(0)
 
-    if "counted_qty" not in df.columns:
-        df["counted_qty"] = 0
-    else:
-        df["counted_qty"] = pd.to_numeric(df["counted_qty"], errors="coerce").fillna(0)
-
+    df["expected_qty"] = pd.to_numeric(df.get("expected_qty", 0), errors="coerce").fillna(0)
+    df["counted_qty"] = pd.to_numeric(df.get("counted_qty", 0), errors="coerce").fillna(0)
     df["qty_diff"] = df["counted_qty"] - df["expected_qty"]
 
-    # Extrai e normaliza LPN / Container de forma robusta por linha
     def get_row_lpn(row):
         for col in ["lpn", "lpn_id.key", "lpn_id", "container_nbr", "container_id.key"]:
             if col in row and pd.notna(row[col]):
@@ -414,7 +421,6 @@ def evaluate_multi_count(df):
 
     df["lpn"] = df.apply(get_row_lpn, axis=1)
 
-    # Extrai e normaliza Item
     def get_row_item(row):
         for col in ["item_id.key", "item_id", "item_key", "item_nbr"]:
             if col in row and pd.notna(row[col]):
@@ -425,7 +431,6 @@ def evaluate_multi_count(df):
 
     df["item_id.key"] = df.apply(get_row_item, axis=1)
 
-    # Extrai e normaliza Localização
     def get_row_loc(row):
         for col in ["location_id.key", "location_id", "location_barcode"]:
             if col in row and pd.notna(row[col]):
@@ -436,13 +441,11 @@ def evaluate_multi_count(df):
 
     df["location_id.key"] = df.apply(get_row_loc, axis=1)
 
-    # Ordena data de criação dos cabeçalhos
     if "create_ts_hdr" in df.columns:
         df["create_ts_hdr_dt"] = pd.to_datetime(df["create_ts_hdr"], errors="coerce")
     else:
         df["create_ts_hdr_dt"] = pd.to_datetime(df.get("create_ts", pd.Timestamp.now()))
 
-    # Mapeia a sequência cronológica de contagem por Localização (1ª, 2ª, 3ª...)
     hdr_order = (
         df[["location_id.key", "hdr_id", "create_ts_hdr_dt"]]
         .drop_duplicates()
@@ -452,15 +455,11 @@ def evaluate_multi_count(df):
     hdr_seq_map = dict(zip(hdr_order["hdr_id"], hdr_order["count_sequence"]))
     df["count_sequence"] = df["hdr_id"].map(hdr_seq_map).fillna(1).astype(int)
 
-    # Adiciona status traduzido em português
     if "status_id_hdr" in df.columns:
         df["status_wms_pt"] = df["status_id_hdr"].apply(translate_status_id)
-    elif "status_id" in df.columns:
-        df["status_wms_pt"] = df["status_id"].apply(translate_status_id)
     else:
-        df["status_wms_pt"] = "Não Informado"
+        df["status_wms_pt"] = df.get("status_id", 0).apply(translate_status_id)
 
-    # Avaliação das Regras Multi-Contagem no nível de detalhe (Item, Qtd, LPN)
     hdr_action_map = {}
 
     for loc, loc_df in df.groupby("location_id.key"):
@@ -480,18 +479,16 @@ def evaluate_multi_count(df):
 
             h_dtls = loc_df[loc_df["hdr_id"] == h_id]
 
-            # Constrói o perfil de detalhes: {(item, lpn): quantidade}
             counted_profile = {}
             expected_profile = {}
             for _, d in h_dtls.iterrows():
-                key = (str(d["item_id.key"]), str(d["lpn"]))
-                counted_profile[key] = float(d["counted_qty"])
-                expected_profile[key] = float(d["expected_qty"])
+                k = (str(d["item_id.key"]), str(d["lpn"]))
+                counted_profile[k] = float(d["counted_qty"])
+                expected_profile[k] = float(d["expected_qty"])
 
             profiles[seq] = counted_profile
             expected_profiles[seq] = expected_profile
 
-            # Status prévio no WMS (em português)
             if status == 30:
                 hdr_action_map[h_id] = "Já Aprovado"
                 continue
@@ -502,9 +499,8 @@ def evaluate_multi_count(df):
                 hdr_action_map[h_id] = translate_status_id(status)
                 continue
 
-            # Status 20 (Pendente) -> Aplicação das Regras:
+            # Status 20 (Pendente):
             if seq == 1:
-                # 1ª CONTAGEM: Se der divergência com o esperado, recusa. Se bater, aprova.
                 has_diff = any(
                     counted_profile.get(k, 0.0) != expected_profile.get(k, 0.0)
                     for k in set(counted_profile.keys()) | set(expected_profile.keys())
@@ -513,32 +509,22 @@ def evaluate_multi_count(df):
                     hdr_action_map[h_id] = "Rejeição Automática"
                 else:
                     hdr_action_map[h_id] = "Aprovação Automática"
-
-            elif seq == 2:
-                # 2ª CONTAGEM: Se a segunda bater com a primeira (Item, Qtd, LPN), aprova. Senão, recusa.
-                p1 = profiles.get(1, {})
-                matches_p1 = (counted_profile == p1)
-                if matches_p1:
-                    hdr_action_map[h_id] = "Aprovação Automática"
-                else:
-                    hdr_action_map[h_id] = "Rejeição Automática"
-
-            elif seq == 3:
-                # 3ª CONTAGEM: Se a terceira bater com a 1ª OU com a 2ª, aprova. Senão, recusa.
-                p1 = profiles.get(1, {})
-                p2 = profiles.get(2, {})
-                matches_p1 = (counted_profile == p1)
-                matches_p2 = (counted_profile == p2)
-                if matches_p1 or matches_p2:
-                    hdr_action_map[h_id] = "Aprovação Automática"
-                else:
-                    hdr_action_map[h_id] = "Rejeição Automática"
             else:
-                hdr_action_map[h_id] = "Revisão Necessária"
+                # N-ésima contagem: se bater com QUALQUER uma das anteriores (1..N-1) -> Aprova
+                matched_previous = False
+                for prev_seq in range(1, seq):
+                    if profiles.get(prev_seq) == counted_profile:
+                        matched_previous = True
+                        break
+
+                if matched_previous:
+                    hdr_action_map[h_id] = "Aprovação Automática"
+                else:
+                    hdr_action_map[h_id] = "Rejeição Automática"
 
     df["system_action"] = df["hdr_id"].map(hdr_action_map).fillna("Revisão Necessária")
 
-    # Tabela comparativa (Localização, Item, LPN x 1ª, 2ª, 3ª contagens)
+    # Tabela comparativa (Posição x 7 contagens)
     pivot_df = df.pivot_table(
         index=["location_id.key", "item_id.key", "lpn"],
         columns="count_sequence",
@@ -546,12 +532,12 @@ def evaluate_multi_count(df):
         aggfunc="first"
     ).reset_index()
 
-    col_rename = {1: "1ª Contagem", 2: "2ª Contagem", 3: "3ª Contagem"}
-    pivot_df = pivot_df.rename(columns={c: col_rename[c] for c in pivot_df.columns if c in col_rename})
-
-    for c in ["1ª Contagem", "2ª Contagem", "3ª Contagem"]:
-        if c not in pivot_df.columns:
-            pivot_df[c] = None
+    for i in range(1, 8):
+        c_label = f"{i}ª Contagem"
+        if i in pivot_df.columns:
+            pivot_df.rename(columns={i: c_label}, inplace=True)
+        else:
+            pivot_df[c_label] = None
 
     latest_df = (
         df.sort_values(by=["location_id.key", "count_sequence"])
@@ -567,36 +553,28 @@ def evaluate_multi_count(df):
         how="left"
     )
 
-    # Formata nome das colunas comparativas
     comp_df = comp_df.rename(columns={
         "location_id.key": "Localização",
         "item_id.key": "Item",
         "lpn": "LPN / Container",
         "expected_qty": "Qtd Esperada",
-        "system_action": "Ação Final"
+        "system_action": "Última Ação Recomendada"
     })
+
+    final_cols = [
+        "Localização", "Item", "LPN / Container", "Qtd Esperada",
+        "1ª Contagem", "2ª Contagem", "3ª Contagem", "4ª Contagem",
+        "5ª Contagem", "6ª Contagem", "7ª Contagem", "Última Ação Recomendada"
+    ]
+    comp_df = comp_df[[c for c in final_cols if c in comp_df.columns]]
 
     return df, comp_df
 
 
-# --- AUTOMATED PIPELINE ---
-def run_automated_pipeline(facility_id, create_ts_gte, create_ts_lte=None):
-    """
-    Executa o pipeline completo:
-    1. Busca cabeçalhos e detalhes.
-    2. Avalia as contagens com base em Item, Quantidade e LPN.
-    3. Executa bulk_approve para os elegíveis.
-    4. Executa bulk_reject para os divergentes.
-    5. Ao rejeitar, busca novas tarefas geradas e executa bulk_hold automaticamente.
-    6. Atualiza os DataFrames com os resultados da execução.
-    """
-    # 1. Busca cabeçalhos
+def fetch_all_counts_data(facility_id, create_ts_gte, create_ts_lte=None):
     hdr_data = fetch_headers(facility_id, create_ts_gte, create_ts_lte)
     if not hdr_data:
-        return {
-            "status": "empty",
-            "message": "Nenhum ajuste de contagem encontrado para os critérios informados."
-        }
+        return pd.DataFrame(), pd.DataFrame()
 
     hdr_ids = [str(item["id"]) for item in hdr_data]
     dtl_data = fetch_details(hdr_ids)
@@ -605,12 +583,8 @@ def run_automated_pipeline(facility_id, create_ts_gte, create_ts_lte=None):
     df_dtl = pd.json_normalize(dtl_data) if dtl_data else pd.DataFrame()
 
     if df_dtl.empty:
-        return {
-            "status": "empty",
-            "message": "Cabeçalhos encontrados, mas nenhum registro de detalhe retornado."
-        }
+        return df_hdr, pd.DataFrame()
 
-    # Merge cabeçalhos e detalhes
     df = pd.merge(
         df_dtl,
         df_hdr,
@@ -620,79 +594,97 @@ def run_automated_pipeline(facility_id, create_ts_gte, create_ts_lte=None):
         suffixes=('_dtl', '_hdr')
     )
 
-    # 2. Avaliação multi-contagem
-    df_evaluated, comp_df = evaluate_multi_count(df)
+    return evaluate_multi_count_dataset(df)
 
-    # 3. Filtra apenas pendentes (status_id_hdr == 20)
+
+# --- AUTOMATED PIPELINE PROCESSANDO EM BATCHES DE 100 E AÇÃO ASSÍNCRONA DE HOLD POR LOTE ---
+def execute_actions_pipeline(df_evaluated, facility_id, create_ts_gte):
+    """
+    Executa o pipeline em lotes de 100:
+    1. Aprovações em lotes de 100.
+    2. Rejeições em lotes de 100 com busca e retencao (Hold) assíncrona IMEDIATAMENTE após cada lote recusado.
+    """
     pending_df = df_evaluated[df_evaluated["status_id_hdr"] == 20]
     df_to_approve = pending_df[pending_df["system_action"].isin(["Aprovação Automática", "Auto-Approve"])]
     df_to_reject = pending_df[pending_df["system_action"].isin(["Rejeição Automática", "Auto-Reject"])]
 
-    execution_log = {
+    log = {
         "approved_count": 0,
         "approved_groups": [],
         "rejected_count": 0,
         "rejected_groups": [],
         "held_count": 0,
         "held_tasks": [],
-        "df_held": pd.DataFrame()
+        "df_held_list": []
     }
 
-    # 4. Executa Aprovações Automáticas
+    # 1. Aprovações em Lotes de 100
     if not df_to_approve.empty:
         appr_res = bulk_approve_headers(df_to_approve, facility_id=facility_id)
         if appr_res and appr_res.status_code == 200:
             appr_data = appr_res.json()
-            execution_log["approved_count"] = appr_data.get("success_count", len(df_to_approve["group_nbr"].unique()))
-            execution_log["approved_groups"] = df_to_approve["group_nbr"].dropna().unique().tolist()
+            log["approved_count"] = appr_data.get("success_count", len(df_to_approve["group_nbr"].unique()))
+            log["approved_groups"] = df_to_approve["group_nbr"].dropna().unique().tolist()
 
-    # 5. Executa Rejeições Automáticas e Retenção de Novas Tarefas
+    # 2. Rejeições em Lotes de 100 com Hold Assíncrono por Lote
     if not df_to_reject.empty:
-        # Timestamp de referência pouco antes da rejeição para capturar as tarefas recém-criadas
-        rejection_start_ts = (datetime.now() - timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%S.000000-03:00")
+        reject_groups = df_to_reject["group_nbr"].dropna().astype(int).unique().tolist()
 
-        rej_res = bulk_reject_headers(df_to_reject, facility_id=facility_id)
-        if rej_res and rej_res.status_code == 200:
-            rej_data = rej_res.json()
-            execution_log["rejected_count"] = rej_data.get("success_count", len(df_to_reject["group_nbr"].unique()))
-            execution_log["rejected_groups"] = df_to_reject["group_nbr"].dropna().unique().tolist()
+        for chunk_groups in chunk_list(reject_groups, chunk_size=BATCH_SIZE):
+            chunk_df_reject = df_to_reject[df_to_reject["group_nbr"].isin(chunk_groups)]
+            chunk_locations = set(chunk_df_reject["location_id.key"].dropna().unique())
 
-        # Pequena pausa para garantir que o WMS concluiu a criação da nova tarefa de recontagem
-        time.sleep(1.5)
+            # Marca o timestamp de disparo deste lote específico
+            batch_ts = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S.000000-03:00")
 
-        # Busca novas tarefas em status 'Pronto' (status_id = 10)
-        df_new_tasks = fetch_ready_tasks(create_ts_gte=rejection_start_ts, facility_id=facility_id)
-        rejected_locations = set(df_to_reject["location_id.key"].dropna().unique())
+            # Executa a rejeição do lote de 100
+            rej_res = bulk_reject_headers(chunk_df_reject, facility_id=facility_id)
 
-        if not df_new_tasks.empty:
-            loc_col = "next_location_id.key" if "next_location_id.key" in df_new_tasks.columns else "location_barcode"
-            if loc_col in df_new_tasks.columns:
-                target_tasks = df_new_tasks[df_new_tasks[loc_col].isin(rejected_locations)]
-            else:
-                target_tasks = df_new_tasks
+            if rej_res and rej_res.status_code == 200:
+                rej_data = rej_res.json()
+                succ_rej = rej_data.get("success_count", len(chunk_groups))
+                log["rejected_count"] += succ_rej
+                log["rejected_groups"].extend(chunk_groups)
 
-            if target_tasks.empty and not df_new_tasks.empty:
-                target_tasks = df_new_tasks
+                # Pausa para garantir que o WMS processou a criação das novas tarefas para o lote
+                time.sleep(1.2)
 
-            if not target_tasks.empty:
-                task_ids = target_tasks["id"].dropna().tolist()
-                hold_res = bulk_hold_tasks(task_ids)
-                if hold_res and hold_res.status_code == 200:
-                    hold_data = hold_res.json()
-                    execution_log["held_count"] = hold_data.get("success_count", len(task_ids))
-                    execution_log["held_tasks"] = task_ids
-                    execution_log["df_held"] = target_tasks
+                # Busca as tarefas geradas para este lote específico de posições recusadas
+                df_new_tasks = fetch_ready_tasks(create_ts_gte=batch_ts, facility_id=facility_id)
 
-    # 6. Atualiza o status de execução no DataFrame de Detalhes
+                if not df_new_tasks.empty:
+                    loc_col = "next_location_id.key" if "next_location_id.key" in df_new_tasks.columns else "location_barcode"
+                    if loc_col in df_new_tasks.columns:
+                        target_tasks = df_new_tasks[df_new_tasks[loc_col].isin(chunk_locations)]
+                    else:
+                        target_tasks = df_new_tasks
+
+                    if not target_tasks.empty:
+                        task_ids = target_tasks["id"].dropna().tolist()
+                        # Executa o Hold para as novas tarefas do lote de 100
+                        hold_res = bulk_hold_tasks(task_ids, batch_size=BATCH_SIZE)
+                        if hold_res and hold_res.status_code == 200:
+                            hold_data = hold_res.json()
+                            log["held_count"] += hold_data.get("success_count", len(task_ids))
+                            log["held_tasks"].extend(task_ids)
+                            log["df_held_list"].append(target_tasks)
+
+    # Consolida DataFrames de tarefas retidas
+    if log["df_held_list"]:
+        log["df_held"] = pd.concat(log["df_held_list"], ignore_index=True).drop_duplicates(subset=["id"])
+    else:
+        log["df_held"] = pd.DataFrame()
+
+    # Atualiza visualização de execução
     def get_exec_status(row):
         action = row["system_action"]
         grp = row.get("group_nbr")
         if action in ("Aprovação Automática", "Auto-Approve"):
-            if grp in execution_log["approved_groups"]:
+            if grp in log["approved_groups"]:
                 return "✅ Aprovado com Sucesso"
             return "⚠️ Aguardando / Falha na Aprovação"
         elif action in ("Rejeição Automática", "Auto-Reject"):
-            if grp in execution_log["rejected_groups"]:
+            if grp in log["rejected_groups"]:
                 return "❌ Rejeitado & Nova Tarefa Retida"
             return "⚠️ Aguardando / Falha na Rejeição"
         elif action in ("Já Aprovado", "Already Approved"):
@@ -706,298 +698,185 @@ def run_automated_pipeline(facility_id, create_ts_gte, create_ts_lte=None):
     return {
         "status": "success",
         "df_details": df_evaluated,
-        "comp_df": comp_df,
-        "execution_log": execution_log
+        "execution_log": log
     }
 
 
-# --- DATAFRAME FILTER UTILITY ---
-def filter_dataframe(df: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
-    """
-    Componente interativo para filtragem dinâmica de todas as colunas de um DataFrame.
-    Inclui busca rápida global por texto e filtros individuais por coluna selecionada.
-    """
+# --- FILTRO DINÂMICO INTERATIVO ---
+def render_interactive_filter(df, key_prefix):
     if df.empty:
         return df
 
     df_filtered = df.copy()
 
-    with st.expander(f"🔍 Filtrar Colunas deste DataFrame ({len(df)} registros totais)", expanded=False):
-        col_global, col_select = st.columns([1.5, 2])
+    with st.expander(f"🔍 Filtrar Colunas deste DataFrame ({len(df)} registros)", expanded=False):
+        c1, c2 = st.columns([1.5, 2])
+        with c1:
+            q = st.text_input("Busca Rápida:", placeholder="Ex: SKU, LPN, Localização...", key=f"{key_prefix}_q")
+        with c2:
+            cols = st.multiselect("Filtrar por Coluna Específica:", options=df.columns.tolist(), key=f"{key_prefix}_cols")
 
-        with col_global:
-            search_term = st.text_input(
-                "Busca Rápida (em todas as colunas):",
-                placeholder="Ex: SKU, LPN, Localização, Status...",
-                key=f"{key_prefix}_global_search"
-            )
-
-        with col_select:
-            selected_columns = st.multiselect(
-                "Selecione colunas para aplicar filtros específicos:",
-                options=df.columns.tolist(),
-                default=[],
-                key=f"{key_prefix}_selected_cols"
-            )
-
-        # 1. Aplicação da busca global
-        if search_term:
-            q = str(search_term).strip().lower()
-            mask = df_filtered.astype(str).apply(
-                lambda row: row.str.lower().str.contains(q, regex=False)
-            ).any(axis=1)
+        if q:
+            q_str = str(q).strip().lower()
+            mask = df_filtered.astype(str).apply(lambda r: r.str.lower().str.contains(q_str, regex=False)).any(axis=1)
             df_filtered = df_filtered[mask]
 
-        # 2. Aplicação de filtros específicos por coluna
-        if selected_columns:
-            st.write("---")
-            grid_cols = st.columns(min(len(selected_columns), 3))
-
-            for idx, col in enumerate(selected_columns):
-                target_col = grid_cols[idx % len(grid_cols)]
-                with target_col:
+        if cols:
+            grid = st.columns(min(len(cols), 3))
+            for idx, col in enumerate(cols):
+                with grid[idx % len(grid)]:
                     series = df[col].dropna()
-
-                    # Caso 1: Coluna Numérica
-                    if pd.api.types.is_numeric_dtype(df[col]):
-                        if not series.empty:
-                            min_val = float(series.min())
-                            max_val = float(series.max())
-                            if min_val < max_val:
-                                step = 1.0 if pd.api.types.is_integer_dtype(df[col]) else 0.1
-                                num_range = st.slider(
-                                    f"Intervalo de `{col}`:",
-                                    min_value=min_val,
-                                    max_value=max_val,
-                                    value=(min_val, max_val),
-                                    step=step,
-                                    key=f"{key_prefix}_num_{col}"
-                                )
-                                df_filtered = df_filtered[
-                                    df_filtered[col].between(num_range[0], num_range[1])
-                                ]
-                            else:
-                                st.caption(f"`{col}`: valor único ({min_val})")
-
-                    # Caso 2: Coluna Datetime
-                    elif pd.api.types.is_datetime64_any_dtype(df[col]):
-                        if not series.empty:
-                            min_d = series.min().date()
-                            max_d = series.max().date()
-                            if min_d < max_d:
-                                dt_range = st.date_input(
-                                    f"Período de `{col}`:",
-                                    value=(min_d, max_d),
-                                    key=f"{key_prefix}_dt_{col}"
-                                )
-                                if len(dt_range) == 2:
-                                    df_filtered = df_filtered[
-                                        (df_filtered[col].dt.date >= dt_range[0]) &
-                                        (df_filtered[col].dt.date <= dt_range[1])
-                                    ]
-                            else:
-                                st.caption(f"`{col}`: data única ({min_d})")
-
-                    # Caso 3: Coluna Textual / Categórica
+                    if pd.api.types.is_numeric_dtype(df[col]) and not series.empty:
+                        min_v, max_v = float(series.min()), float(series.max())
+                        if min_v < max_v:
+                            v = st.slider(f"`{col}`:", min_v, max_v, (min_v, max_v), key=f"{key_prefix}_s_{col}")
+                            df_filtered = df_filtered[df_filtered[col].between(v[0], v[1])]
                     else:
-                        unique_options = sorted([str(x) for x in series.unique() if str(x).strip() != ""])
-                        if len(unique_options) <= 50:
-                            chosen = st.multiselect(
-                                f"Opções de `{col}`:",
-                                options=unique_options,
-                                default=[],
-                                key=f"{key_prefix}_cat_{col}"
-                            )
+                        opts = sorted([str(x) for x in series.unique() if str(x).strip() != ""])
+                        if len(opts) <= 50:
+                            chosen = st.multiselect(f"`{col}`:", options=opts, key=f"{key_prefix}_m_{col}")
                             if chosen:
                                 df_filtered = df_filtered[df_filtered[col].astype(str).isin(chosen)]
-                        else:
-                            txt_filter = st.text_input(
-                                f"Contém em `{col}`:",
-                                key=f"{key_prefix}_txt_{col}"
-                            )
-                            if txt_filter:
-                                df_filtered = df_filtered[
-                                    df_filtered[col].astype(str).str.contains(
-                                        str(txt_filter), case=False, na=False, regex=False
-                                    )
-                                ]
 
-    # Linha com contagem de registros e botão de exportação
-    badge_col, dl_col = st.columns([4, 1])
-    with badge_col:
-        st.caption(f"Mostrando **{len(df_filtered)}** de **{len(df)}** registros.")
-    with dl_col:
-        csv_data = df_filtered.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Exportar CSV",
-            data=csv_data,
-            file_name=f"{key_prefix}_export.csv",
-            mime="text/csv",
-            key=f"{key_prefix}_dl_btn"
-        )
-
+    st.caption(f"Mostrando **{len(df_filtered)}** de **{len(df)}** registros.")
     return df_filtered
 
 
-# --- MAIN INTERFACE ---
+# --- INTERFACE PRINCIPAL ---
 def main():
     login_screen()
 
-    st.title("📦 Automação de Contagem Cíclica - Oracle WMS")
-    st.caption("Pipeline automatizado: Busca -> Validação (Item + Qtd + LPN) -> Aprovação -> Rejeição -> Retenção de Tarefas.")
+    st.title("📦 Automação de Aprovação de Contagens Cíclicas")
+    st.caption("Painel automatizado com análise por rodadas de contagem e comparativo geral integrado ao Oracle WMS (em lotes de 100).")
 
-    # Filtros de Data & Unidade definidos pelo usuário via Input
-    st.markdown("### 📅 Filtro de Datas e Unidade (Tasks & Contagens)")
-    with st.container():
-        f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns([2, 1.3, 2, 1.3, 1.2])
+    # Filtros Globais de Data (Fixado de 22/09/2026 até 27/09/2026)
+    st.markdown("### 📅 Filtro de Período do Processamento")
+    f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns([2, 1.3, 2, 1.3, 1.2])
 
-        today = datetime.now().date()
-        init_start = st.session_state.get("filter_start_date", today - timedelta(days=3))
-        init_end = st.session_state.get("filter_end_date", today)
+    fixed_start = date(2026, 9, 22)
+    fixed_end = date(2026, 9, 27)
 
-        with f_col1:
-            sel_start_date = st.date_input("Data Inicial", value=init_start, key="main_start_date")
-        with f_col2:
-            sel_start_time = st.time_input("Hora Inicial", value=datetime.strptime("00:00:00", "%H:%M:%S").time(), key="main_start_time")
-        with f_col3:
-            sel_end_date = st.date_input("Data Final", value=init_end, key="main_end_date")
-        with f_col4:
-            sel_end_time = st.time_input("Hora Final", value=datetime.strptime("23:59:59", "%H:%M:%S").time(), key="main_end_time")
-        with f_col5:
-            facility_id = st.number_input("Facility ID", value=4, step=1, key="main_facility_id")
+    with f_col1:
+        sel_start_date = st.date_input("Data Inicial", value=fixed_start, key="global_start_date")
+    with f_col2:
+        sel_start_time = st.time_input("Hora Inicial", value=dt_time(0, 0, 0), key="global_start_time")
+    with f_col3:
+        sel_end_date = st.date_input("Data Final", value=fixed_end, key="global_end_date")
+    with f_col4:
+        sel_end_time = st.time_input("Hora Final", value=dt_time(23, 59, 59), key="global_end_time")
+    with f_col5:
+        facility_id = st.number_input("Facility ID", value=4, step=1, key="global_facility_id")
 
     create_ts_gte = f"{sel_start_date.isoformat()}T{sel_start_time.strftime('%H:%M:%S')}.000000-03:00"
     create_ts_lte = f"{sel_end_date.isoformat()}T{sel_end_time.strftime('%H:%M:%S')}.999999-03:00"
 
-    st.caption(f"Filtro ativo no WMS: `create_ts >= {create_ts_gte}` e `create_ts <= {create_ts_lte}` | Facility: `{facility_id}`")
-
-    # Sidebar: User info & shortcuts
-    st.sidebar.markdown(f"### 👤 Usuário: `{st.session_state.username}`")
-    st.sidebar.markdown(f"**Facility ID:** `{facility_id}`")
-    st.sidebar.markdown(f"**Período:**\n- Início: `{sel_start_date} {sel_start_time.strftime('%H:%M')}`\n- Fim: `{sel_end_date} {sel_end_time.strftime('%H:%M')}`")
-    if st.sidebar.button("🚪 Logout"):
-        st.session_state.clear()
-        st.rerun()
-
-    # Main Action Button
+    # Botão Principal de Sincronização
     col_btn, _ = st.columns([2, 3])
     with col_btn:
-        execute_clicked = st.button("🚀 Sincronizar & Executar Fluxo Automático", type="primary", use_container_width=True)
+        sync_clicked = st.button("🚀 Sincronizar Dados do WMS", type="primary", use_container_width=True)
 
-    if execute_clicked:
-        with st.spinner(f"Executando pipeline automático ({sel_start_date} até {sel_end_date})..."):
-            pipeline_result = run_automated_pipeline(facility_id, create_ts_gte, create_ts_lte)
-            st.session_state.pipeline_result = pipeline_result
+    if sync_clicked:
+        with st.spinner("Buscando e avaliando contagens no WMS..."):
+            df_eval, comp_df = fetch_all_counts_data(facility_id, create_ts_gte, create_ts_lte)
+            st.session_state.df_evaluated = df_eval
+            st.session_state.comp_df = comp_df
 
-    # Render results if available
-    if "pipeline_result" in st.session_state:
-        res = st.session_state.pipeline_result
+    # Abas Principais
+    tab_blocks, tab_comparative = st.tabs([
+        "🥇 1. Blocos de Aprovações por Contagem",
+        "📊 2. Comparativo Geral de Contagens (1ª a 7ª)"
+    ])
 
-        if res["status"] == "empty":
-            st.warning(res.get("message", "Nenhum registro encontrado."))
-            return
+    # ABA 1: BLOCOS DE APROVAÇÕES
+    with tab_blocks:
+        st.markdown("### 📋 Análise e Ações por Nível/Rodada de Contagem (Em Lotes de 100)")
 
-        df_details = res["df_details"]
-        comp_df = res["comp_df"]
-        log = res["execution_log"]
+        if "df_evaluated" not in st.session_state or st.session_state.df_evaluated.empty:
+            st.info("Clique no botão **'🚀 Sincronizar Dados do WMS'** acima para carregar o painel de aprovações.")
+        else:
+            df_eval = st.session_state.df_evaluated
 
-        # Execution Metrics Cards
-        st.write("---")
-        m_col1, m_col2, m_col3, m_col4, m_col5 = st.columns(5)
-        m_col1.metric("Total Detalhes", len(df_details))
-        m_col2.metric(
-            "Aprovados Auto",
-            f"{log['approved_count']} grupos",
-            delta=f"{len(df_details[df_details['system_action'].isin(['Aprovação Automática', 'Auto-Approve'])])} linhas"
-        )
-        m_col3.metric(
-            "Rejeitados Auto",
-            f"{log['rejected_count']} grupos",
-            delta=f"{len(df_details[df_details['system_action'].isin(['Rejeição Automática', 'Auto-Reject'])])} linhas"
-        )
-        m_col4.metric("Tarefas em Retenção", f"{log['held_count']} tarefas")
-        m_col5.metric(
-            "Revisão Necessária",
-            len(df_details[df_details['system_action'].isin(['Revisão Necessária', 'Review Needed'])])
-        )
+            c_auto1, c_auto2 = st.columns([2.5, 2.5])
+            with c_auto1:
+                if st.button("⚡ Executar Aprovações & Rejeições Automáticas (em Lotes de 100)", type="primary", use_container_width=True):
+                    with st.spinner("Processando lotes de até 100 registros na API..."):
+                        exec_res = execute_actions_pipeline(df_eval, facility_id, create_ts_gte)
+                        log = exec_res["execution_log"]
+                        st.session_state.exec_log = log
+                        
+                        # Recarrega a base atualizada
+                        df_eval, comp_df = fetch_all_counts_data(facility_id, create_ts_gte, create_ts_lte)
+                        st.session_state.df_evaluated = df_eval
+                        st.session_state.comp_df = comp_df
+                        st.success("Fluxo em lote executado com sucesso!")
+                        st.rerun()
 
-        # Execution Feedback Messages
-        if log["approved_count"] > 0:
-            st.success(f"✅ {log['approved_count']} grupo(s) de ajuste aprovados automaticamente com sucesso no WMS!")
-        if log["rejected_count"] > 0:
-            st.warning(f"❌ {log['rejected_count']} grupo(s) de ajuste rejeitados automaticamente pelo WMS.")
-        if log["held_count"] > 0:
-            st.info(f"🔒 {log['held_count']} nova(s) tarefa(s) de recontagem gerada(s) foram colocadas em Retenção (Hold) automaticamente!")
+            if "exec_log" in st.session_state:
+                log = st.session_state.exec_log
+                st.info(f"**Última Automação:** Aprovados: `{log['approved_count']}` grupos | Rejeitados: `{log['rejected_count']}` grupos | Tarefas Retidas em Hold: `{log['held_count']}`")
 
-        # Tabs for Visualizing DataFrames
-        tab_dtl, tab_comp, tab_held = st.tabs([
-            "📋 1. Detalhamento Completo (cc_adjustment_dtl)",
-            "📊 2. Tabela Comparativa (1ª, 2ª e 3ª Contagens)",
-            "🔒 3. Novas Tarefas Retidas em Hold"
-        ])
+            st.write("---")
 
-        with tab_dtl:
-            st.write("### Detalhamento das Contagens no WMS")
-            display_cols = [
-                "location_id.key", "lpn", "item_id.key", "expected_qty", "counted_qty",
-                "qty_diff", "count_sequence", "status_wms_pt", "system_action",
-                "resultado_execucao", "group_nbr", "hdr_id"
-            ]
-            cols_to_show = [c for c in display_cols if c in df_details.columns]
-            rename_dict = {
-                "location_id.key": "Localização",
-                "lpn": "LPN / Container",
-                "item_id.key": "Item",
-                "expected_qty": "Qtd Esperada",
-                "counted_qty": "Qtd Contada",
-                "qty_diff": "Diferença",
-                "count_sequence": "Rodada (Seq)",
-                "status_wms_pt": "Status da Tarefa (WMS)",
-                "system_action": "Ação Definida",
-                "resultado_execucao": "Resultado Execução",
-                "group_nbr": "Grupo Ajuste",
-                "hdr_id": "ID Cabeçalho"
-            }
-            df_display = df_details[cols_to_show].rename(columns=rename_dict)
-            df_display_filtered = filter_dataframe(df_display, key_prefix="dtl")
-            st.dataframe(df_display_filtered, use_container_width=True, height=450)
+            sequences = sorted(df_eval["count_sequence"].unique().tolist())
 
-        with tab_comp:
-            st.write("### Tabela Comparativa de Contagens (Posição vs Item vs LPN)")
-            comp_df_filtered = filter_dataframe(comp_df, key_prefix="comp")
-            st.dataframe(comp_df_filtered, use_container_width=True, height=450)
-
-        with tab_held:
-            st.write("### Tarefas Recém-Criadas Colocadas em Retenção (Hold)")
-            df_held = log.get("df_held", pd.DataFrame())
-            if not df_held.empty:
-                df_held = df_held.copy()
-                if "status_id" in df_held.columns:
-                    df_held["status_pt"] = df_held["status_id"].apply(translate_status_id)
-                elif "status" in df_held.columns:
-                    df_held["status_pt"] = df_held["status"].apply(translate_status_id)
-                else:
-                    df_held["status_pt"] = "Pendente (10)"
-
-                task_cols = [
-                    "id", "task_nbr", "next_location_id.key", "task_type_id.key",
-                    "status_pt", "create_ts", "assigned_user"
-                ]
-                cols_held_show = [c for c in task_cols if c in df_held.columns]
-                rename_held = {
-                    "id": "ID Tarefa",
-                    "task_nbr": "Número Tarefa",
-                    "next_location_id.key": "Localização",
-                    "task_type_id.key": "Tipo Tarefa",
-                    "status_pt": "Status da Tarefa (WMS)",
-                    "create_ts": "Data Criação",
-                    "assigned_user": "Usuário Atribuído"
-                }
-                df_held_display = df_held[cols_held_show].rename(columns=rename_held)
-                df_held_filtered = filter_dataframe(df_held_display, key_prefix="held")
-                st.dataframe(df_held_filtered, use_container_width=True)
+            if not sequences:
+                st.warning("Nenhuma contagem encontrada.")
             else:
-                st.info("Nenhuma nova tarefa colocada em retenção nesta execução.")
+                sub_tab_labels = [f"{s}ª Contagem" for s in sequences]
+                sub_tabs = st.tabs(sub_tab_labels)
+
+                for idx, seq in enumerate(sequences):
+                    with sub_tabs[idx]:
+                        df_seq = df_eval[df_eval["count_sequence"] == seq]
+
+                        st.markdown(f"#### Contagens Pendentes/Analisadas na **{seq}ª Contagem**")
+                        
+                        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                        col_m1.metric("Total de Registros", len(df_seq))
+                        col_m2.metric("Pendentes de Ação", len(df_seq[df_seq["status_id_hdr"] == 20]))
+                        col_m3.metric("Recomendado Aprovar", len(df_seq[df_seq["system_action"] == "Aprovação Automática"]))
+                        col_m4.metric("Recomendado Rejeitar", len(df_seq[df_seq["system_action"] == "Rejeição Automática"]))
+
+                        if seq == 1:
+                            st.info("💡 **Regras da 1ª Contagem:** Se a contagem bater com a quantidade esperada -> Aprovação. Divergente -> Rejeição e retenção imediata da nova tarefa em lote.")
+                        elif seq == 2:
+                            st.info("💡 **Regras da 2ª Contagem:** Comparativo entre 1ª e 2ª contagem. Se a 2ª for igual à 1ª -> Aprovação. Senão -> Rejeição.")
+                        elif seq == 3:
+                            st.info("💡 **Regras da 3ª Contagem:** Comparativo das três contagens. Se a 3ª bater com a 1ª OU com a 2ª -> Aprovação.")
+                        else:
+                            st.info(f"💡 **Regras da {seq}ª Contagem:** Se a {seq}ª contagem bater com QUALQUER contagem anterior (1..{seq-1}) -> Aprovação.")
+
+                        df_seq_display = render_interactive_filter(df_seq, key_prefix=f"block_{seq}")
+
+                        cols_show = [
+                            "hdr_id", "group_nbr", "location_id.key", "item_id.key", "lpn",
+                            "expected_qty", "counted_qty", "qty_diff", "status_wms_pt", "system_action"
+                        ]
+                        cols_valid = [c for c in cols_show if c in df_seq_display.columns]
+
+                        st.dataframe(df_seq_display[cols_valid], use_container_width=True, height=350)
+
+    # ABA 2: COMPARATIVO GERAL DE CONTAGENS (1ª a 7ª)
+    with tab_comparative:
+        st.markdown("### 📊 Comparativo Geral de Contagens por Posição/Item/LPN")
+        st.caption("Linha única por posição trazendo as 7 comparações de contagens históricas.")
+
+        col_comp_btn, _ = st.columns([2.5, 2.5])
+        with col_comp_btn:
+            comp_refresh_clicked = st.button("🔄 Atualizar Tabela Comparativa de Contagens", type="secondary", use_container_width=True)
+
+        if comp_refresh_clicked:
+            with st.spinner("Atualizando tabela comparativa diretamente do WMS..."):
+                _, comp_df = fetch_all_counts_data(facility_id, create_ts_gte, create_ts_lte)
+                st.session_state.comp_df = comp_df
+                st.success("Tabela comparativa atualizada com sucesso!")
+
+        if "comp_df" in st.session_state and not st.session_state.comp_df.empty:
+            comp_df = st.session_state.comp_df
+            filtered_comp_df = render_interactive_filter(comp_df, key_prefix="comp_tab")
+            st.dataframe(filtered_comp_df, use_container_width=True, height=500)
+        else:
+            st.info("Nenhum dado comparativo carregado. Clique no botão de atualização acima ou sincronize os dados do WMS.")
 
 
 if __name__ == "__main__":
