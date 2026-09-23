@@ -8,7 +8,7 @@ from requests.auth import HTTPBasicAuth
 
 # --- CONFIGURAÇÃO ---
 BASE_URL = "https://k1.wms.ocs.oraclecloud.com:443/arcoed/wms/lgfapi/v10/entity"
-BATCH_SIZE = 100  # Tamanho do lote máximo para chamadas em Bulk na API WMS
+BATCH_SIZE = 50  # Tamanho do lote máximo reduzido para 50 para chamadas em Bulk na API WMS
 
 st.set_page_config(
     page_title="WMS Cycle Count Automation & Approvals",
@@ -33,10 +33,10 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# --- AUXILIAR DE FATIAMENTO EM LOTES (BATCHES DE 100) ---
+# --- AUXILIAR DE FATIAMENTO EM LOTES (BATCHES DE 50) ---
 def chunk_list(lst, chunk_size=BATCH_SIZE):
     """
-    Divide qualquer lista em sublistas de tamanho até `chunk_size` (padrão 100).
+    Divide qualquer lista em sublistas de tamanho até `chunk_size` (padrão 50).
     """
     for i in range(0, len(lst), chunk_size):
         yield lst[i:i + chunk_size]
@@ -147,7 +147,7 @@ def fetch_details(hdr_ids):
 
 def bulk_approve_headers(df_approve, facility_id=4):
     """
-    Executa POST para /cc_adjustment_hdr/bulk_approve/ fatiando em lotes de 100
+    Executa POST para /cc_adjustment_hdr/bulk_approve/ fatiando em lotes de 50
     com fallback individual apenas para itens do lote que falharem.
     """
     session = get_session()
@@ -161,7 +161,6 @@ def bulk_approve_headers(df_approve, facility_id=4):
     total_failures = 0
     all_details = {}
 
-    # Processamento em lotes de 100 para evitar sobrecarregar a API
     for batch_groups in chunk_list(group_numbers, chunk_size=BATCH_SIZE):
         payload = {
             "parameters": {
@@ -181,7 +180,6 @@ def bulk_approve_headers(df_approve, facility_id=4):
             total_success += res_data.get("success_count", len(batch_groups))
             total_failures += res_data.get("failure_count", 0)
         else:
-            # Fallback individual apenas para os itens deste lote de 100
             st.warning(f"Lote de aprovação (tamanho {len(batch_groups)}) falhou no bulk. Executando fallback individual...")
             batch_df = df_approve[df_approve["group_nbr"].isin(batch_groups)].drop_duplicates(subset=["group_nbr"])
 
@@ -204,7 +202,6 @@ def bulk_approve_headers(df_approve, facility_id=4):
                     total_failures += 1
                     all_details[str(row["group_nbr"])] = f"Status {single_res.status_code}"
 
-    # Retorna objeto simulado unificado de resposta
     mock_response = requests.Response()
     mock_response.status_code = 200
     mock_payload = {
@@ -219,7 +216,7 @@ def bulk_approve_headers(df_approve, facility_id=4):
 
 def bulk_reject_headers(df_reject, facility_id=4):
     """
-    Executa POST para /cc_adjustment_hdr/bulk_reject/ fatiando em lotes de 100
+    Executa POST para /cc_adjustment_hdr/bulk_reject/ fatiando em lotes de 50
     com fallback individual por lote se necessário.
     """
     session = get_session()
@@ -320,7 +317,7 @@ def fetch_ready_tasks(create_ts_gte, facility_id=4, create_ts_lte=None):
 
 def bulk_hold_tasks(task_ids, batch_size=BATCH_SIZE):
     """
-    Coloca tarefas em retenção usando POST /task/bulk_hold/ em lotes de 100 com fallback.
+    Coloca tarefas em retenção usando POST /task/bulk_hold/ em lotes de 50 com fallback.
     """
     session = get_session()
     hold_url = f"{BASE_URL}/task/bulk_hold/"
@@ -501,6 +498,7 @@ def evaluate_multi_count_dataset(df):
 
             # Status 20 (Pendente):
             if seq == 1:
+                # 1ª Contagem: Se divergente do sistema -> Rejeita; Se igual -> Aprova
                 has_diff = any(
                     counted_profile.get(k, 0.0) != expected_profile.get(k, 0.0)
                     for k in set(counted_profile.keys()) | set(expected_profile.keys())
@@ -509,8 +507,15 @@ def evaluate_multi_count_dataset(df):
                     hdr_action_map[h_id] = "Rejeição Automática"
                 else:
                     hdr_action_map[h_id] = "Aprovação Automática"
+            elif seq == 2:
+                # 2ª Contagem: Se bater com a 1ª contagem -> Aprova; Senão -> Rejeita
+                profile_seq1 = profiles.get(1, {})
+                if profile_seq1 and counted_profile == profile_seq1:
+                    hdr_action_map[h_id] = "Aprovação Automática"
+                else:
+                    hdr_action_map[h_id] = "Rejeição Automática"
             else:
-                # N-ésima contagem: se bater com QUALQUER uma das anteriores (1..N-1) -> Aprova
+                # Demais contagens: Aprova se bater com qualquer contagem anterior
                 matched_previous = False
                 for prev_seq in range(1, seq):
                     if profiles.get(prev_seq) == counted_profile:
@@ -597,12 +602,12 @@ def fetch_all_counts_data(facility_id, create_ts_gte, create_ts_lte=None):
     return evaluate_multi_count_dataset(df)
 
 
-# --- AUTOMATED PIPELINE PROCESSANDO EM BATCHES DE 100 E AÇÃO ASSÍNCRONA DE HOLD POR LOTE ---
+# --- AUTOMATED PIPELINE PROCESSANDO EM BATCHES DE 50 E AÇÃO ASSÍNCRONA DE HOLD POR LOTE ---
 def execute_actions_pipeline(df_evaluated, facility_id, create_ts_gte):
     """
-    Executa o pipeline em lotes de 100:
-    1. Aprovações em lotes de 100.
-    2. Rejeições em lotes de 100 com busca e retencao (Hold) assíncrona IMEDIATAMENTE após cada lote recusado.
+    Executa o pipeline em lotes de 50:
+    1. Aprovações em lotes de 50.
+    2. Rejeições em lotes de 50 com busca e retenção (Hold) assíncrona IMEDIATAMENTE após cada lote recusado.
     """
     pending_df = df_evaluated[df_evaluated["status_id_hdr"] == 20]
     df_to_approve = pending_df[pending_df["system_action"].isin(["Aprovação Automática", "Auto-Approve"])]
@@ -618,7 +623,7 @@ def execute_actions_pipeline(df_evaluated, facility_id, create_ts_gte):
         "df_held_list": []
     }
 
-    # 1. Aprovações em Lotes de 100
+    # 1. Aprovações em Lotes de 50
     if not df_to_approve.empty:
         appr_res = bulk_approve_headers(df_to_approve, facility_id=facility_id)
         if appr_res and appr_res.status_code == 200:
@@ -626,7 +631,7 @@ def execute_actions_pipeline(df_evaluated, facility_id, create_ts_gte):
             log["approved_count"] = appr_data.get("success_count", len(df_to_approve["group_nbr"].unique()))
             log["approved_groups"] = df_to_approve["group_nbr"].dropna().unique().tolist()
 
-    # 2. Rejeições em Lotes de 100 com Hold Assíncrono por Lote
+    # 2. Rejeições em Lotes de 50 com Hold Assíncrono por Lote
     if not df_to_reject.empty:
         reject_groups = df_to_reject["group_nbr"].dropna().astype(int).unique().tolist()
 
@@ -637,7 +642,7 @@ def execute_actions_pipeline(df_evaluated, facility_id, create_ts_gte):
             # Marca o timestamp de disparo deste lote específico
             batch_ts = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S.000000-03:00")
 
-            # Executa a rejeição do lote de 100
+            # Executa a rejeição do lote de 50
             rej_res = bulk_reject_headers(chunk_df_reject, facility_id=facility_id)
 
             if rej_res and rej_res.status_code == 200:
@@ -661,7 +666,7 @@ def execute_actions_pipeline(df_evaluated, facility_id, create_ts_gte):
 
                     if not target_tasks.empty:
                         task_ids = target_tasks["id"].dropna().tolist()
-                        # Executa o Hold para as novas tarefas do lote de 100
+                        # Executa o Hold para as novas tarefas do lote de 50
                         hold_res = bulk_hold_tasks(task_ids, batch_size=BATCH_SIZE)
                         if hold_res and hold_res.status_code == 200:
                             hold_data = hold_res.json()
@@ -747,7 +752,7 @@ def main():
     login_screen()
 
     st.title("📦 Automação de Aprovação de Contagens Cíclicas")
-    st.caption("Painel automatizado com análise por rodadas de contagem e comparativo geral integrado ao Oracle WMS (em lotes de 100).")
+    st.caption("Painel automatizado com análise por rodadas de contagem e comparativo geral integrado ao Oracle WMS (em lotes de 50).")
 
     # Filtros Globais de Data (Fixado de 22/09/2026 até 27/09/2026)
     st.markdown("### 📅 Filtro de Período do Processamento")
@@ -789,7 +794,7 @@ def main():
 
     # ABA 1: BLOCOS DE APROVAÇÕES
     with tab_blocks:
-        st.markdown("### 📋 Análise e Ações por Nível/Rodada de Contagem (Em Lotes de 100)")
+        st.markdown("### 📋 Análise e Ações por Nível/Rodada de Contagem (Em Lotes de 50)")
 
         if "df_evaluated" not in st.session_state or st.session_state.df_evaluated.empty:
             st.info("Clique no botão **'🚀 Sincronizar Dados do WMS'** acima para carregar o painel de aprovações.")
@@ -798,8 +803,8 @@ def main():
 
             c_auto1, c_auto2 = st.columns([2.5, 2.5])
             with c_auto1:
-                if st.button("⚡ Executar Aprovações & Rejeições Automáticas (em Lotes de 100)", type="primary", use_container_width=True):
-                    with st.spinner("Processando lotes de até 100 registros na API..."):
+                if st.button("⚡ Executar Aprovações & Rejeições Automáticas (em Lotes de 50)", type="primary", use_container_width=True):
+                    with st.spinner("Processando lotes de até 50 registros na API..."):
                         exec_res = execute_actions_pipeline(df_eval, facility_id, create_ts_gte)
                         log = exec_res["execution_log"]
                         st.session_state.exec_log = log
@@ -838,11 +843,11 @@ def main():
                         col_m4.metric("Recomendado Rejeitar", len(df_seq[df_seq["system_action"] == "Rejeição Automática"]))
 
                         if seq == 1:
-                            st.info("💡 **Regras da 1ª Contagem:** Se a contagem bater com a quantidade esperada -> Aprovação. Divergente -> Rejeição e retenção imediata da nova tarefa em lote.")
+                            st.info("💡 **Regras da 1ª Contagem:** Se divergente do sistema -> Rejeição e retenção da nova tarefa. Se igual -> Aprovação.")
                         elif seq == 2:
-                            st.info("💡 **Regras da 2ª Contagem:** Comparativo entre 1ª e 2ª contagem. Se a 2ª for igual à 1ª -> Aprovação. Senão -> Rejeição.")
+                            st.info("💡 **Regras da 2ª Contagem:** Se a 2ª contagem for igual à 1ª -> Aprovação. Senão -> Rejeição e retenção da nova tarefa.")
                         elif seq == 3:
-                            st.info("💡 **Regras da 3ª Contagem:** Comparativo das três contagens. Se a 3ª bater com a 1ª OU com a 2ª -> Aprovação.")
+                            st.info("💡 **Regras da 3ª Contagem:** Comparativo das contagens. Se a 3ª bater com a 1ª OU com a 2ª -> Aprovação.")
                         else:
                             st.info(f"💡 **Regras da {seq}ª Contagem:** Se a {seq}ª contagem bater com QUALQUER contagem anterior (1..{seq-1}) -> Aprovação.")
 
