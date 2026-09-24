@@ -285,17 +285,17 @@ def bulk_reject_headers(df_reject, facility_id=4):
 
 def fetch_ready_tasks(create_ts_gte, facility_id=4, create_ts_lte=None):
     """
-    Busca tarefas CC em status Pronto (status_id=10, task_type_id=19).
+    Busca tarefas CC (task_type_id=19) para retenção.
     """
     session = get_session()
     tasks_data = []
     params = [
         f"facility_id={facility_id}",
         "task_type_id=19",
-        "status_id=10",
-        f"create_ts__gte={create_ts_gte}",
         "page_size=100"
     ]
+    if create_ts_gte:
+        params.append(f"create_ts__gte={create_ts_gte}")
     if create_ts_lte:
         params.append(f"create_ts__lte={create_ts_lte}")
 
@@ -350,6 +350,11 @@ def bulk_hold_tasks(task_ids, batch_size=BATCH_SIZE):
             for tid in batch_tasks:
                 single_url = f"{BASE_URL}/task/{tid}/hold/"
                 single_res = session.post(single_url)
+                if single_res.status_code not in [200, 204]:
+                    # Tentativa de fallback alternativo via POST simples
+                    single_url_alt = f"{BASE_URL}/task/hold/"
+                    single_res = session.post(single_url_alt, json={"id": int(tid)})
+
                 if single_res.status_code in [200, 204]:
                     total_success += 1
                 else:
@@ -496,9 +501,9 @@ def evaluate_multi_count_dataset(df):
                 hdr_action_map[h_id] = translate_status_id(status)
                 continue
 
-            # Status 20 (Pendente):
+            # --- REGRAS DE APROVAÇÃO / REJEIÇÃO ---
             if seq == 1:
-                # 1ª Contagem: Se divergente do sistema -> Rejeita; Se igual -> Aprova
+                # 1ª Contagem: Se bater com o sistema -> Aprova. Se NÃO bater -> Rejeita.
                 has_diff = any(
                     counted_profile.get(k, 0.0) != expected_profile.get(k, 0.0)
                     for k in set(counted_profile.keys()) | set(expected_profile.keys())
@@ -508,24 +513,20 @@ def evaluate_multi_count_dataset(df):
                 else:
                     hdr_action_map[h_id] = "Aprovação Automática"
             elif seq == 2:
-                # 2ª Contagem: Se bater com a 1ª contagem -> Aprova; Senão -> Rejeita
+                # 2ª Contagem: Se bater com a 1ª contagem -> Aprova. Se NÃO bater -> Rejeita.
                 profile_seq1 = profiles.get(1, {})
                 if profile_seq1 and counted_profile == profile_seq1:
                     hdr_action_map[h_id] = "Aprovação Automática"
                 else:
                     hdr_action_map[h_id] = "Rejeição Automática"
             else:
-                # Demais contagens: Aprova se bater com qualquer contagem anterior
-                matched_previous = False
-                for prev_seq in range(1, seq):
-                    if profiles.get(prev_seq) == counted_profile:
-                        matched_previous = True
-                        break
-
-                if matched_previous:
-                    hdr_action_map[h_id] = "Aprovação Automática"
-                else:
+                # 3ª Contagem em diante: NÃO aprova mais do que a 2ª contagem!
+                # Apenas recusar/rejeitar se divergente da contagem anterior.
+                profile_prev = profiles.get(seq - 1, {})
+                if profile_prev and counted_profile != profile_prev:
                     hdr_action_map[h_id] = "Rejeição Automática"
+                else:
+                    hdr_action_map[h_id] = "Revisão Manual"
 
     df["system_action"] = df["hdr_id"].map(hdr_action_map).fillna("Revisão Necessária")
 
@@ -602,12 +603,12 @@ def fetch_all_counts_data(facility_id, create_ts_gte, create_ts_lte=None):
     return evaluate_multi_count_dataset(df)
 
 
-# --- AUTOMATED PIPELINE PROCESSANDO EM BATCHES DE 50 E AÇÃO ASSÍNCRONA DE HOLD POR LOTE ---
+# --- AUTOMATED PIPELINE PROCESSANDO EM BATCHES DE 50 E AÇÃO DE HOLD POR LOTE ---
 def execute_actions_pipeline(df_evaluated, facility_id, create_ts_gte):
     """
     Executa o pipeline em lotes de 50:
-    1. Aprovações em lotes de 50.
-    2. Rejeições em lotes de 50 com busca e retenção (Hold) assíncrona IMEDIATAMENTE após cada lote recusado.
+    1. Aprovações em lotes de 50 (restrito até a 2ª contagem).
+    2. Rejeições em lotes de 50 com busca e retenção (Hold) imediata das novas tarefas criadas.
     """
     pending_df = df_evaluated[df_evaluated["status_id_hdr"] == 20]
     df_to_approve = pending_df[pending_df["system_action"].isin(["Aprovação Automática", "Auto-Approve"])]
@@ -631,16 +632,13 @@ def execute_actions_pipeline(df_evaluated, facility_id, create_ts_gte):
             log["approved_count"] = appr_data.get("success_count", len(df_to_approve["group_nbr"].unique()))
             log["approved_groups"] = df_to_approve["group_nbr"].dropna().unique().tolist()
 
-    # 2. Rejeições em Lotes de 50 com Hold Assíncrono por Lote
+    # 2. Rejeições em Lotes de 50 com Hold das novas tarefas
     if not df_to_reject.empty:
         reject_groups = df_to_reject["group_nbr"].dropna().astype(int).unique().tolist()
 
         for chunk_groups in chunk_list(reject_groups, chunk_size=BATCH_SIZE):
             chunk_df_reject = df_to_reject[df_to_reject["group_nbr"].isin(chunk_groups)]
-            chunk_locations = set(chunk_df_reject["location_id.key"].dropna().unique())
-
-            # Marca o timestamp de disparo deste lote específico
-            batch_ts = (datetime.now() - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%S.000000-03:00")
+            chunk_locations = set(chunk_df_reject["location_id.key"].dropna().astype(str).unique())
 
             # Executa a rejeição do lote de 50
             rej_res = bulk_reject_headers(chunk_df_reject, facility_id=facility_id)
@@ -651,21 +649,26 @@ def execute_actions_pipeline(df_evaluated, facility_id, create_ts_gte):
                 log["rejected_count"] += succ_rej
                 log["rejected_groups"].extend(chunk_groups)
 
-                # Pausa para garantir que o WMS processou a criação das novas tarefas para o lote
-                time.sleep(1.2)
+                # Pausa breve para o WMS processar e gerar as novas tarefas
+                time.sleep(1.5)
 
-                # Busca as tarefas geradas para este lote específico de posições recusadas
-                df_new_tasks = fetch_ready_tasks(create_ts_gte=batch_ts, facility_id=facility_id)
+                # Busca as novas tarefas geradas para o período utilizando a janela global
+                df_new_tasks = fetch_ready_tasks(create_ts_gte=create_ts_gte, facility_id=facility_id)
 
                 if not df_new_tasks.empty:
-                    loc_col = "next_location_id.key" if "next_location_id.key" in df_new_tasks.columns else "location_barcode"
-                    if loc_col in df_new_tasks.columns:
-                        target_tasks = df_new_tasks[df_new_tasks[loc_col].isin(chunk_locations)]
+                    # Mapeia em múltiplas colunas possíveis de localização
+                    loc_cols = [c for c in ["next_location_id.key", "location_barcode", "location_id.key", "display_location", "location_id"] if c in df_new_tasks.columns]
+                    
+                    if loc_cols:
+                        mask = pd.Series(False, index=df_new_tasks.index)
+                        for c in loc_cols:
+                            mask = mask | df_new_tasks[c].astype(str).isin(chunk_locations)
+                        target_tasks = df_new_tasks[mask]
                     else:
                         target_tasks = df_new_tasks
 
                     if not target_tasks.empty:
-                        task_ids = target_tasks["id"].dropna().tolist()
+                        task_ids = target_tasks["id"].dropna().unique().tolist()
                         # Executa o Hold para as novas tarefas do lote de 50
                         hold_res = bulk_hold_tasks(task_ids, batch_size=BATCH_SIZE)
                         if hold_res and hold_res.status_code == 200:
@@ -754,7 +757,7 @@ def main():
     st.title("📦 Automação de Aprovação de Contagens Cíclicas")
     st.caption("Painel automatizado com análise por rodadas de contagem e comparativo geral integrado ao Oracle WMS (em lotes de 50).")
 
-    # Filtros Globais de Data (Fixado de 22/09/2026 até 27/09/2026)
+    # Filtros Globais de Data
     st.markdown("### 📅 Filtro de Período do Processamento")
     f_col1, f_col2, f_col3, f_col4, f_col5 = st.columns([2, 1.3, 2, 1.3, 1.2])
 
@@ -846,10 +849,8 @@ def main():
                             st.info("💡 **Regras da 1ª Contagem:** Se divergente do sistema -> Rejeição e retenção da nova tarefa. Se igual -> Aprovação.")
                         elif seq == 2:
                             st.info("💡 **Regras da 2ª Contagem:** Se a 2ª contagem for igual à 1ª -> Aprovação. Senão -> Rejeição e retenção da nova tarefa.")
-                        elif seq == 3:
-                            st.info("💡 **Regras da 3ª Contagem:** Comparativo das contagens. Se a 3ª bater com a 1ª OU com a 2ª -> Aprovação.")
                         else:
-                            st.info(f"💡 **Regras da {seq}ª Contagem:** Se a {seq}ª contagem bater com QUALQUER contagem anterior (1..{seq-1}) -> Aprovação.")
+                            st.info(f"💡 **Regras a partir da {seq}ª Contagem:** Trava de segurança ativada. Não há aprovação automática para contagens superiores à 2ª. Apenas rejeição se houver divergência em relação à contagem anterior.")
 
                         df_seq_display = render_interactive_filter(df_seq, key_prefix=f"block_{seq}")
 
